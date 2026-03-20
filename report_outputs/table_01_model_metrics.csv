@@ -1,0 +1,5 @@
+metric,value
+overall_accuracy,0.6673333333333333
+gender_0_accuracy,0.6511919698870765
+gender_1_accuracy,0.6856330014224751
+gender_accuracy_gap_abs,0.03444103153539857

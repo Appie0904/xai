@@ -1,52 +1,55 @@
 import json
-import os
 import random
 import re
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Tuple
 
 import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
 import shap
 import torch
+import torch.nn as nn
 from datasets import DatasetDict, load_dataset
 from lime.lime_text import LimeTextExplainer
 from sklearn.metrics import accuracy_score
+from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
-from transformers import (
-    AutoModelForSequenceClassification,
-    AutoTokenizer,
-    Trainer,
-    TrainingArguments,
-)
-
-matplotlib.use("Agg")
 
 
 @dataclass
 class ExperimentConfig:
     dataset_name: str = "LabHC/bias_in_bios"
-    model_name: str = "prajjwal1/bert-tiny"
     output_dir: str = "report_outputs"
     random_seed: int = 42
-    train_size: int = 12000
+    train_size: int = 15000
     dev_size: int = 3000
-    test_size: int = 4000
-    counterfactual_size: int = 400
-    max_length: int = 192
-    num_train_epochs: float = 1.0
-    per_device_train_batch_size: int = 32
-    per_device_eval_batch_size: int = 64
-    learning_rate: float = 2e-5
-    max_explanations: int = 12
+    test_size: int = 3000
+    max_length: int = 120
+    max_vocab_size: int = 30000
+    batch_size: int = 128
+    embedding_dim: int = 128
+    hidden_dim: int = 96
+    dropout: float = 0.3
+    epochs: int = 4
+    learning_rate: float = 1e-3
+    counterfactual_size: int = 350
+    max_explanations: int = 10
     lime_num_features: int = 10
-    lime_num_samples: int = 700
-    shap_max_evals: int = 300
+    lime_num_samples: int = 400
+    shap_token_limit: int = 40
+    shap_nsamples: int = 120
     top_k_alignment: int = 3
+
+
+PAD_IDX = 0
+UNK_IDX = 1
 
 
 def set_seed(seed: int) -> None:
@@ -55,6 +58,10 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def simple_tokenize(text: str) -> List[str]:
+    return re.findall(r"[A-Za-z']+", text.lower())
 
 
 def load_and_sample_dataset(config: ExperimentConfig) -> DatasetDict:
@@ -72,102 +79,137 @@ def load_and_sample_dataset(config: ExperimentConfig) -> DatasetDict:
     return sampled
 
 
-def tokenize_dataset(
-    dataset: DatasetDict, tokenizer: AutoTokenizer, max_length: int
-) -> DatasetDict:
-    def preprocess(batch: Dict[str, List]) -> Dict[str, List]:
-        tokenized = tokenizer(
-            batch["hard_text"],
-            truncation=True,
-            padding="max_length",
-            max_length=max_length,
+def build_vocab(texts: List[str], max_vocab_size: int) -> Dict[str, int]:
+    counter: Counter = Counter()
+    for text in texts:
+        counter.update(simple_tokenize(text))
+    most_common = counter.most_common(max_vocab_size - 2)
+    vocab = {"<PAD>": PAD_IDX, "<UNK>": UNK_IDX}
+    for idx, (token, _) in enumerate(most_common, start=2):
+        vocab[token] = idx
+    return vocab
+
+
+def encode_text(text: str, vocab: Dict[str, int], max_length: int) -> List[int]:
+    tokens = simple_tokenize(text)
+    ids = [vocab.get(token, UNK_IDX) for token in tokens[:max_length]]
+    if len(ids) < max_length:
+        ids.extend([PAD_IDX] * (max_length - len(ids)))
+    return ids
+
+
+def prepare_tensors(
+    split,
+    vocab: Dict[str, int],
+    max_length: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    x = torch.tensor(
+        [encode_text(text, vocab, max_length) for text in split["hard_text"]],
+        dtype=torch.long,
+    )
+    y = torch.tensor(split["profession"], dtype=torch.long)
+    g = torch.tensor(split["gender"], dtype=torch.long)
+    return x, y, g
+
+
+class AttentionBiLSTM(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        num_labels: int,
+        embedding_dim: int,
+        hidden_dim: int,
+        dropout: float,
+    ):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=PAD_IDX)
+        self.lstm = nn.LSTM(
+            input_size=embedding_dim,
+            hidden_size=hidden_dim,
+            batch_first=True,
+            bidirectional=True,
         )
-        tokenized["labels"] = batch["profession"]
-        return tokenized
+        self.attn_proj = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.attn_score = nn.Linear(hidden_dim, 1)
+        self.dropout = nn.Dropout(dropout)
+        self.classifier = nn.Linear(hidden_dim * 2, num_labels)
 
-    tokenized_ds = dataset.map(preprocess, batched=True)
-    tokenized_ds = tokenized_ds.remove_columns(["hard_text", "profession", "gender"])
-    tokenized_ds.set_format(type="torch")
-    return tokenized_ds
-
-
-def build_model_and_tokenizer(
-    model_name: str, num_labels: int
-) -> Tuple[AutoTokenizer, AutoModelForSequenceClassification]:
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForSequenceClassification.from_pretrained(
-        model_name,
-        num_labels=num_labels,
-    )
-    return tokenizer, model
+    def forward(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        mask = input_ids.ne(PAD_IDX)
+        emb = self.embedding(input_ids)
+        lstm_out, _ = self.lstm(emb)
+        attn_hidden = torch.tanh(self.attn_proj(lstm_out))
+        scores = self.attn_score(attn_hidden).squeeze(-1)
+        scores = scores.masked_fill(~mask, -1e9)
+        attn_weights = torch.softmax(scores, dim=-1)
+        context = torch.bmm(attn_weights.unsqueeze(1), lstm_out).squeeze(1)
+        logits = self.classifier(self.dropout(context))
+        return logits, attn_weights
 
 
-def train_model(
-    model: AutoModelForSequenceClassification,
-    tokenized_ds: DatasetDict,
-    output_dir: str,
-    config: ExperimentConfig,
-) -> Trainer:
-    training_args = TrainingArguments(
-        output_dir=os.path.join(output_dir, "training_artifacts"),
-        evaluation_strategy="epoch",
-        save_strategy="no",
-        logging_strategy="epoch",
-        learning_rate=config.learning_rate,
-        num_train_epochs=config.num_train_epochs,
-        per_device_train_batch_size=config.per_device_train_batch_size,
-        per_device_eval_batch_size=config.per_device_eval_batch_size,
-        report_to=[],
-        seed=config.random_seed,
-    )
+def train_epoch(
+    model: AttentionBiLSTM,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    criterion: nn.Module,
+    device: torch.device,
+) -> float:
+    model.train()
+    losses = []
+    for x_batch, y_batch in loader:
+        x_batch = x_batch.to(device)
+        y_batch = y_batch.to(device)
+        optimizer.zero_grad()
+        logits, _ = model(x_batch)
+        loss = criterion(logits, y_batch)
+        loss.backward()
+        optimizer.step()
+        losses.append(float(loss.item()))
+    return float(np.mean(losses)) if losses else 0.0
 
-    def compute_metrics(eval_pred) -> Dict[str, float]:
-        logits, labels = eval_pred
-        preds = np.argmax(logits, axis=-1)
-        return {"accuracy": accuracy_score(labels, preds)}
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=tokenized_ds["train"],
-        eval_dataset=tokenized_ds["dev"],
-        compute_metrics=compute_metrics,
-    )
-    trainer.train()
-    return trainer
+def evaluate(
+    model: AttentionBiLSTM,
+    loader: DataLoader,
+    device: torch.device,
+) -> Tuple[np.ndarray, np.ndarray]:
+    model.eval()
+    all_probs = []
+    all_preds = []
+    with torch.no_grad():
+        for x_batch, _ in loader:
+            x_batch = x_batch.to(device)
+            logits, _ = model(x_batch)
+            probs = torch.softmax(logits, dim=-1).cpu().numpy()
+            preds = np.argmax(probs, axis=1)
+            all_probs.append(probs)
+            all_preds.append(preds)
+    probs_arr = np.vstack(all_probs) if all_probs else np.array([])
+    preds_arr = np.concatenate(all_preds) if all_preds else np.array([])
+    return probs_arr, preds_arr
 
 
 def predict_proba_texts(
-    model: AutoModelForSequenceClassification,
-    tokenizer: AutoTokenizer,
+    model: AttentionBiLSTM,
     texts: List[str],
+    vocab: Dict[str, int],
     max_length: int,
     batch_size: int,
     device: torch.device,
 ) -> np.ndarray:
-    model.eval()
+    if not texts:
+        return np.empty((0, model.classifier.out_features))
+    x = torch.tensor([encode_text(text, vocab, max_length) for text in texts], dtype=torch.long)
+    dataset = TensorDataset(x)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     probs_list = []
+    model.eval()
     with torch.no_grad():
-        for start in range(0, len(texts), batch_size):
-            batch_texts = texts[start : start + batch_size]
-            encodings = tokenizer(
-                batch_texts,
-                truncation=True,
-                padding=True,
-                max_length=max_length,
-                return_tensors="pt",
-            )
-            encodings = {k: v.to(device) for k, v in encodings.items()}
-            outputs = model(**encodings)
-            probs = torch.softmax(outputs.logits, dim=-1).cpu().numpy()
-            probs_list.append(probs)
-    return np.vstack(probs_list) if probs_list else np.empty((0, model.num_labels))
-
-
-def normalize_token(token: str) -> str:
-    token = token.replace("##", "").strip().lower()
-    token = re.sub(r"[^a-z]+", "", token)
-    return token
+        for (x_batch,) in loader:
+            x_batch = x_batch.to(device)
+            logits, _ = model(x_batch)
+            probs_list.append(torch.softmax(logits, dim=-1).cpu().numpy())
+    return np.vstack(probs_list)
 
 
 def build_gender_lexicon() -> set:
@@ -181,6 +223,7 @@ def build_gender_lexicon() -> set:
         "father",
         "brother",
         "son",
+        "husband",
         "she",
         "her",
         "hers",
@@ -191,13 +234,11 @@ def build_gender_lexicon() -> set:
         "sister",
         "daughter",
         "wife",
-        "husband",
     }
 
 
 def contains_gendered_token(text: str, gender_terms: set) -> bool:
-    tokens = re.findall(r"\b\w+\b", text.lower())
-    return any(token in gender_terms for token in tokens)
+    return any(token in gender_terms for token in simple_tokenize(text))
 
 
 def swap_gender_terms(text: str) -> str:
@@ -223,7 +264,6 @@ def swap_gender_terms(text: str) -> str:
         "husband": "wife",
         "wife": "husband",
     }
-
     pattern = re.compile(
         r"\b(" + "|".join(sorted(replacements.keys(), key=len, reverse=True)) + r")\b",
         re.IGNORECASE,
@@ -231,12 +271,12 @@ def swap_gender_terms(text: str) -> str:
 
     def replace(match: re.Match) -> str:
         src = match.group(0)
-        repl = replacements[src.lower()]
+        tgt = replacements[src.lower()]
         if src.isupper():
-            return repl.upper()
+            return tgt.upper()
         if src[0].isupper():
-            return repl.capitalize()
-        return repl
+            return tgt.capitalize()
+        return tgt
 
     return pattern.sub(replace, text)
 
@@ -254,7 +294,7 @@ def infer_swap_direction(text: str) -> str:
         "daughter",
         "wife",
     }
-    tokens = set(re.findall(r"\b\w+\b", text.lower()))
+    tokens = set(simple_tokenize(text))
     if tokens.intersection(male_terms) and not tokens.intersection(female_terms):
         return "male->female"
     if tokens.intersection(female_terms) and not tokens.intersection(male_terms):
@@ -262,56 +302,31 @@ def infer_swap_direction(text: str) -> str:
     return "mixed"
 
 
-def aggregate_wordpiece_scores(tokens: List[str], scores: np.ndarray) -> Dict[str, float]:
-    word_scores: Dict[str, float] = {}
-    current_word = ""
-    current_score = 0.0
-
-    def flush() -> None:
-        nonlocal current_word, current_score
-        if current_word:
-            norm = normalize_token(current_word)
-            if norm:
-                word_scores[norm] = word_scores.get(norm, 0.0) + float(current_score)
-        current_word = ""
-        current_score = 0.0
-
-    for token, score in zip(tokens, scores):
-        if token in {"[CLS]", "[SEP]", "[PAD]"}:
-            flush()
-            continue
-        if token.startswith("##"):
-            current_word += token[2:]
-            current_score += float(score)
-        else:
-            flush()
-            current_word = token
-            current_score = float(score)
-    flush()
-    return word_scores
+def normalize_token(token: str) -> str:
+    return re.sub(r"[^a-z]+", "", token.lower())
 
 
 def attention_word_importance(
-    model: AutoModelForSequenceClassification,
-    tokenizer: AutoTokenizer,
+    model: AttentionBiLSTM,
     text: str,
+    vocab: Dict[str, int],
     max_length: int,
     device: torch.device,
 ) -> Dict[str, float]:
+    tokens = simple_tokenize(text)[:max_length]
+    if not tokens:
+        return {}
+    ids = torch.tensor([encode_text(text, vocab, max_length)], dtype=torch.long).to(device)
     model.eval()
-    enc = tokenizer(
-        text,
-        truncation=True,
-        max_length=max_length,
-        return_tensors="pt",
-    )
-    enc = {k: v.to(device) for k, v in enc.items()}
     with torch.no_grad():
-        outputs = model(**enc, output_attentions=True)
-    attentions = outputs.attentions[-1][0]  # heads x seq x seq
-    cls_attention = attentions[:, 0, :].mean(dim=0).cpu().numpy()
-    tokens = tokenizer.convert_ids_to_tokens(enc["input_ids"][0].cpu().numpy())
-    return aggregate_wordpiece_scores(tokens, cls_attention)
+        _, attn_weights = model(ids)
+    scores = attn_weights[0][: len(tokens)].cpu().numpy()
+    importance: Dict[str, float] = {}
+    for token, score in zip(tokens, scores):
+        norm = normalize_token(token)
+        if norm:
+            importance[norm] = importance.get(norm, 0.0) + float(score)
+    return importance
 
 
 def lime_word_importance(
@@ -329,7 +344,7 @@ def lime_word_importance(
         num_features=num_features,
         num_samples=num_samples,
     )
-    importance = {}
+    importance: Dict[str, float] = {}
     for token, score in explanation.as_list(label=int(pred_label)):
         norm = normalize_token(token)
         if norm:
@@ -338,28 +353,35 @@ def lime_word_importance(
 
 
 def shap_word_importance(
-    shap_explainer: shap.Explainer,
     text: str,
     pred_label: int,
-    max_evals: int,
+    predict_fn: Callable[[List[str]], np.ndarray],
+    token_limit: int,
+    nsamples: int,
 ) -> Dict[str, float]:
-    shap_values = shap_explainer([text], max_evals=max_evals)
-    tokens_raw = shap_values.data[0]
-    if isinstance(tokens_raw, str):
-        tokens = re.findall(r"\b\w+\b", tokens_raw.lower())
-    else:
-        tokens = [str(t) for t in tokens_raw]
+    tokens = simple_tokenize(text)[:token_limit]
+    if not tokens:
+        return {}
 
-    values = shap_values.values
-    if values.ndim == 3:
-        token_scores = values[0, :, int(pred_label)]
-    elif values.ndim == 2:
-        token_scores = values[0, :]
+    def masked_predict(mask_matrix: np.ndarray) -> np.ndarray:
+        masked_texts = []
+        for mask_row in mask_matrix:
+            kept = [tok for tok, keep in zip(tokens, mask_row) if keep > 0.5]
+            masked_texts.append(" ".join(kept) if kept else "[UNK]")
+        probs = predict_fn(masked_texts)[:, int(pred_label)]
+        return probs
+
+    background = np.zeros((1, len(tokens)))
+    eval_point = np.ones((1, len(tokens)))
+    kernel_explainer = shap.KernelExplainer(masked_predict, background)
+    shap_values = kernel_explainer.shap_values(eval_point, nsamples=nsamples, silent=True)
+    if isinstance(shap_values, list):
+        scores = np.array(shap_values[0]).reshape(-1)
     else:
-        token_scores = np.array([])
+        scores = np.array(shap_values).reshape(-1)
 
     importance: Dict[str, float] = {}
-    for token, score in zip(tokens, token_scores):
+    for token, score in zip(tokens, scores):
         norm = normalize_token(token)
         if norm:
             importance[norm] = importance.get(norm, 0.0) + float(score)
@@ -370,47 +392,36 @@ def attribution_alignment_metrics(
     importance: Dict[str, float], gender_terms: set, top_k: int
 ) -> Dict[str, float]:
     if not importance:
-        return {
-            "gender_mass": 0.0,
-            "topk_hit": 0.0,
-            "first_gender_rank": float("inf"),
-            "mrr": 0.0,
-        }
-    sorted_items = sorted(importance.items(), key=lambda x: abs(x[1]), reverse=True)
-    total_mass = sum(abs(v) for _, v in sorted_items) + 1e-12
-    gender_mass = sum(abs(v) for t, v in sorted_items if t in gender_terms) / total_mass
-    topk_tokens = [token for token, _ in sorted_items[:top_k]]
-    topk_hit = 1.0 if any(token in gender_terms for token in topk_tokens) else 0.0
-
-    first_gender_rank = float("inf")
-    for idx, (token, _) in enumerate(sorted_items, start=1):
+        return {"gender_mass": 0.0, "topk_hit": 0.0, "first_gender_rank": float("inf"), "mrr": 0.0}
+    ranked = sorted(importance.items(), key=lambda x: abs(x[1]), reverse=True)
+    total = sum(abs(v) for _, v in ranked) + 1e-12
+    gender_mass = sum(abs(v) for t, v in ranked if t in gender_terms) / total
+    topk_tokens = [t for t, _ in ranked[:top_k]]
+    topk_hit = 1.0 if any(t in gender_terms for t in topk_tokens) else 0.0
+    first_rank = float("inf")
+    for idx, (token, _) in enumerate(ranked, start=1):
         if token in gender_terms:
-            first_gender_rank = float(idx)
+            first_rank = float(idx)
             break
-    mrr = 0.0 if not np.isfinite(first_gender_rank) else 1.0 / first_gender_rank
-    return {
-        "gender_mass": float(gender_mass),
-        "topk_hit": topk_hit,
-        "first_gender_rank": first_gender_rank,
-        "mrr": mrr,
-    }
+    mrr = 0.0 if not np.isfinite(first_rank) else 1.0 / first_rank
+    return {"gender_mass": float(gender_mass), "topk_hit": topk_hit, "first_gender_rank": first_rank, "mrr": mrr}
 
 
 def save_tables_and_plots(
     model_metrics_df: pd.DataFrame,
     profession_gap_df: pd.DataFrame,
     counterfactual_df: pd.DataFrame,
-    explanation_records_df: pd.DataFrame,
+    explanation_df: pd.DataFrame,
     output_dir: Path,
-) -> None:
+) -> pd.DataFrame:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     model_metrics_df.to_csv(output_dir / "table_01_model_metrics.csv", index=False)
     profession_gap_df.to_csv(output_dir / "table_02_profession_gap_top10.csv", index=False)
-    counterfactual_df.to_csv(output_dir / "table_03_counterfactual_examples.csv", index=False)
+    counterfactual_df.head(120).to_csv(output_dir / "table_03_counterfactual_examples.csv", index=False)
 
     method_summary = (
-        explanation_records_df.groupby("method")
+        explanation_df.groupby("method")
         .agg(
             mean_gender_mass=("gender_mass", "mean"),
             topk_hit_rate=("topk_hit", "mean"),
@@ -424,9 +435,7 @@ def save_tables_and_plots(
 
     sns.set_theme(style="whitegrid")
 
-    direction_rate = (
-        counterfactual_df.groupby("swap_direction")["changed_prediction"].mean().reset_index()
-    )
+    direction_rate = counterfactual_df.groupby("swap_direction")["changed_prediction"].mean().reset_index()
     plt.figure(figsize=(8, 5))
     sns.barplot(data=direction_rate, x="swap_direction", y="changed_prediction")
     plt.ylim(0, 1)
@@ -442,20 +451,22 @@ def save_tables_and_plots(
     plt.ylim(0, 1)
     plt.ylabel("Top-k Gender Token Hit Rate")
     plt.xlabel("Explanation Method")
-    plt.title("Human-Intuition Alignment (Top-k Hit)")
+    plt.title("Human-Intuition Alignment by Method")
     plt.tight_layout()
     plt.savefig(output_dir / "figure_02_topk_hit_rate.png", dpi=200)
     plt.close()
 
     plt.figure(figsize=(8, 5))
-    sns.boxplot(data=explanation_records_df, x="method", y="gender_mass")
+    sns.boxplot(data=explanation_df, x="method", y="gender_mass")
     plt.ylim(0, 1)
     plt.ylabel("Attribution Mass on Gender Terms")
     plt.xlabel("Explanation Method")
-    plt.title("Bias Signal Concentration Across Methods")
+    plt.title("Bias Signal Concentration Across Explanations")
     plt.tight_layout()
     plt.savefig(output_dir / "figure_03_gender_mass_boxplot.png", dpi=200)
     plt.close()
+
+    return method_summary
 
 
 def write_report_markdown(
@@ -464,68 +475,43 @@ def write_report_markdown(
     method_summary_df: pd.DataFrame,
     counterfactual_df: pd.DataFrame,
 ) -> None:
-    overall_acc = float(
-        model_metrics_df.loc[model_metrics_df["metric"] == "overall_accuracy", "value"].iloc[0]
-    )
-    male_acc = float(
-        model_metrics_df.loc[model_metrics_df["metric"] == "gender_0_accuracy", "value"].iloc[0]
-    )
-    female_acc = float(
-        model_metrics_df.loc[model_metrics_df["metric"] == "gender_1_accuracy", "value"].iloc[0]
-    )
+    overall = float(model_metrics_df.loc[model_metrics_df["metric"] == "overall_accuracy", "value"].iloc[0])
+    g0 = float(model_metrics_df.loc[model_metrics_df["metric"] == "gender_0_accuracy", "value"].iloc[0])
+    g1 = float(model_metrics_df.loc[model_metrics_df["metric"] == "gender_1_accuracy", "value"].iloc[0])
     change_rate = float(counterfactual_df["changed_prediction"].mean())
-
-    best_hit_method = method_summary_df.iloc[0]["method"]
-    best_hit_value = float(method_summary_df.iloc[0]["topk_hit_rate"])
-    low_mass_method = method_summary_df.sort_values("mean_gender_mass").iloc[0]["method"]
-    low_mass_value = float(method_summary_df.sort_values("mean_gender_mass").iloc[0]["mean_gender_mass"])
 
     lines = [
         "# Bias Explainability Report (Bias in Bios)",
         "",
-        "## Core question",
+        "## Question answered",
         (
             "How do attention-based explanations and post-hoc attribution methods "
-            "(SHAP, LIME) differ in revealing and interpreting biased outputs, and how "
-            "well do they align with human intuition?"
+            "(SHAP/LIME) differ for revealing and interpreting biased outputs, and "
+            "how well do they align with human intuition?"
         ),
         "",
-        "## Model and bias stress test",
-        f"- Overall profession-classification accuracy: **{overall_acc:.3f}**",
-        f"- Gender-0 accuracy: **{male_acc:.3f}**",
-        f"- Gender-1 accuracy: **{female_acc:.3f}**",
-        f"- Prediction change rate after gender swapping: **{change_rate:.3f}**",
-        "",
-        "## Explainability findings",
-        (
-            f"- Highest human-alignment (top-k gender-token hit rate): "
-            f"**{best_hit_method} ({best_hit_value:.3f})**"
-        ),
-        (
-            f"- Lowest attribution mass on gender tokens: "
-            f"**{low_mass_method} ({low_mass_value:.3f})**"
-        ),
+        "## Model + bias stress-test snapshot",
+        f"- Overall accuracy: **{overall:.3f}**",
+        f"- Gender-0 accuracy: **{g0:.3f}**",
+        f"- Gender-1 accuracy: **{g1:.3f}**",
+        f"- Counterfactual prediction-change rate after gender swapping: **{change_rate:.3f}**",
         "",
         "## Interpretation",
-        (
-            "Attention is model-internal and often diffuse: it can reveal that gender "
-            "tokens are being attended to, but it is less localized and can be harder "
-            "to interpret causally."
-        ),
-        (
-            "LIME is sparse and local: it typically highlights a short list of words "
-            "driving a single decision, which can be intuitive for case-level bias review."
-        ),
-        (
-            "SHAP gives additive token-level attributions with sign and magnitude, often "
-            "providing stronger consistency across cases at higher computational cost."
-        ),
-        (
-            "Alignment with human intuition can be approximated by whether methods rank "
-            "gendered terms among top explanatory features in counterfactual flips."
-        ),
+        "- Attention provides intrinsic, model-internal token relevance but is often diffuse.",
+        "- LIME gives sparse local feature weights that are easy to inspect case-by-case.",
+        "- SHAP provides additive and signed attributions with stronger cross-case consistency (but higher compute).",
+        "- Alignment with human intuition is approximated with top-k gender token hit rate and attribution mass on gendered words in counterfactual flips.",
         "",
-        "## Report artifacts",
+        "## Method ranking (from this run)",
+    ]
+    for _, row in method_summary_df.iterrows():
+        lines.append(
+            f"- {row['method']}: top-k hit={row['topk_hit_rate']:.3f}, "
+            f"gender-mass={row['mean_gender_mass']:.3f}, mrr={row['mean_mrr']:.3f}"
+        )
+    lines += [
+        "",
+        "## Artifacts",
         "- `table_01_model_metrics.csv`",
         "- `table_02_profession_gap_top10.csv`",
         "- `table_03_counterfactual_examples.csv`",
@@ -534,111 +520,98 @@ def write_report_markdown(
         "- `figure_02_topk_hit_rate.png`",
         "- `figure_03_gender_mass_boxplot.png`",
     ]
-
     (output_dir / "REPORT.md").write_text("\n".join(lines), encoding="utf-8")
 
 
 def main() -> None:
     config = ExperimentConfig()
     set_seed(config.random_seed)
+    output_dir = Path(config.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    out_dir = Path(config.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    print("Loading and sampling dataset...")
-    dataset = load_and_sample_dataset(config)
-
-    num_labels = len(set(dataset["train"]["profession"]))
+    print("Loading dataset...")
+    ds = load_and_sample_dataset(config)
+    num_labels = len(set(ds["train"]["profession"]))
+    print(f"Sample sizes train/dev/test: {len(ds['train'])}/{len(ds['dev'])}/{len(ds['test'])}")
     print(f"Number of labels: {num_labels}")
 
-    tokenizer, model = build_model_and_tokenizer(config.model_name, num_labels)
-    tokenized_ds = tokenize_dataset(dataset, tokenizer, config.max_length)
+    print("Building vocabulary...")
+    vocab = build_vocab(ds["train"]["hard_text"], config.max_vocab_size)
+    print(f"Vocabulary size: {len(vocab)}")
 
-    print("Training classifier...")
-    trainer = train_model(model, tokenized_ds, config.output_dir, config)
+    print("Encoding tensors...")
+    x_train, y_train, _ = prepare_tensors(ds["train"], vocab, config.max_length)
+    x_dev, y_dev, _ = prepare_tensors(ds["dev"], vocab, config.max_length)
+    x_test, y_test, g_test = prepare_tensors(ds["test"], vocab, config.max_length)
+
+    train_loader = DataLoader(TensorDataset(x_train, y_train), batch_size=config.batch_size, shuffle=True)
+    dev_loader = DataLoader(TensorDataset(x_dev, y_dev), batch_size=config.batch_size, shuffle=False)
+    test_loader = DataLoader(TensorDataset(x_test, y_test), batch_size=config.batch_size, shuffle=False)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
+    model = AttentionBiLSTM(
+        vocab_size=len(vocab),
+        num_labels=num_labels,
+        embedding_dim=config.embedding_dim,
+        hidden_dim=config.hidden_dim,
+        dropout=config.dropout,
+    ).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+    criterion = nn.CrossEntropyLoss()
 
-    print("Running test predictions...")
-    test_texts = dataset["test"]["hard_text"]
-    test_labels = np.array(dataset["test"]["profession"])
-    test_gender = np.array(dataset["test"]["gender"])
-    test_probs = predict_proba_texts(
-        model=model,
-        tokenizer=tokenizer,
-        texts=test_texts,
-        max_length=config.max_length,
-        batch_size=config.per_device_eval_batch_size,
-        device=device,
-    )
-    test_preds = np.argmax(test_probs, axis=1)
+    print("Training attention model...")
+    for epoch in range(1, config.epochs + 1):
+        loss = train_epoch(model, train_loader, optimizer, criterion, device)
+        _, dev_preds = evaluate(model, dev_loader, device)
+        dev_acc = accuracy_score(y_dev.numpy(), dev_preds)
+        print(f"Epoch {epoch}/{config.epochs} - train_loss={loss:.4f} dev_acc={dev_acc:.4f}")
 
-    overall_acc = accuracy_score(test_labels, test_preds)
-    gender0_acc = accuracy_score(test_labels[test_gender == 0], test_preds[test_gender == 0])
-    gender1_acc = accuracy_score(test_labels[test_gender == 1], test_preds[test_gender == 1])
+    print("Evaluating test split...")
+    test_probs, test_preds = evaluate(model, test_loader, device)
+    y_test_np = y_test.numpy()
+    g_test_np = g_test.numpy()
+    overall_acc = accuracy_score(y_test_np, test_preds)
+    g0_acc = accuracy_score(y_test_np[g_test_np == 0], test_preds[g_test_np == 0])
+    g1_acc = accuracy_score(y_test_np[g_test_np == 1], test_preds[g_test_np == 1])
 
     model_metrics_df = pd.DataFrame(
         [
             {"metric": "overall_accuracy", "value": overall_acc},
-            {"metric": "gender_0_accuracy", "value": gender0_acc},
-            {"metric": "gender_1_accuracy", "value": gender1_acc},
-            {"metric": "gender_accuracy_gap_abs", "value": abs(gender0_acc - gender1_acc)},
+            {"metric": "gender_0_accuracy", "value": g0_acc},
+            {"metric": "gender_1_accuracy", "value": g1_acc},
+            {"metric": "gender_accuracy_gap_abs", "value": abs(g0_acc - g1_acc)},
         ]
     )
 
-    performance_df = pd.DataFrame(
-        {
-            "profession": test_labels,
-            "pred": test_preds,
-            "gender": test_gender,
-            "correct": (test_labels == test_preds).astype(int),
-        }
+    perf_df = pd.DataFrame(
+        {"profession": y_test_np, "pred": test_preds, "gender": g_test_np, "correct": (y_test_np == test_preds).astype(int)}
     )
-    profession_gap_rows = []
-    for profession_id, group in performance_df.groupby("profession"):
-        g0 = group[group["gender"] == 0]["correct"]
-        g1 = group[group["gender"] == 1]["correct"]
+    gap_rows = []
+    for pid, grp in perf_df.groupby("profession"):
+        g0 = grp[grp["gender"] == 0]["correct"]
+        g1 = grp[grp["gender"] == 1]["correct"]
         if len(g0) > 5 and len(g1) > 5:
-            acc0 = g0.mean()
-            acc1 = g1.mean()
-            profession_gap_rows.append(
+            gap_rows.append(
                 {
-                    "profession_id": int(profession_id),
-                    "gender_0_acc": acc0,
-                    "gender_1_acc": acc1,
-                    "abs_gap": abs(acc0 - acc1),
-                    "n_gender_0": len(g0),
-                    "n_gender_1": len(g1),
+                    "profession_id": int(pid),
+                    "gender_0_acc": float(g0.mean()),
+                    "gender_1_acc": float(g1.mean()),
+                    "abs_gap": float(abs(g0.mean() - g1.mean())),
+                    "n_gender_0": int(len(g0)),
+                    "n_gender_1": int(len(g1)),
                 }
             )
-    profession_gap_df = (
-        pd.DataFrame(profession_gap_rows).sort_values("abs_gap", ascending=False).head(10)
-    )
+    profession_gap_df = pd.DataFrame(gap_rows).sort_values("abs_gap", ascending=False).head(10)
 
     gender_terms = build_gender_lexicon()
     candidate_texts = [
-        text for text in test_texts if contains_gendered_token(text=text, gender_terms=gender_terms)
+        text for text in ds["test"]["hard_text"] if contains_gendered_token(text, gender_terms)
     ][: config.counterfactual_size]
     swapped_texts = [swap_gender_terms(text) for text in candidate_texts]
 
-    print("Scoring counterfactual pairs...")
-    orig_probs = predict_proba_texts(
-        model=model,
-        tokenizer=tokenizer,
-        texts=candidate_texts,
-        max_length=config.max_length,
-        batch_size=config.per_device_eval_batch_size,
-        device=device,
-    )
-    swap_probs = predict_proba_texts(
-        model=model,
-        tokenizer=tokenizer,
-        texts=swapped_texts,
-        max_length=config.max_length,
-        batch_size=config.per_device_eval_batch_size,
-        device=device,
-    )
+    print("Running counterfactual predictions...")
+    orig_probs = predict_proba_texts(model, candidate_texts, vocab, config.max_length, config.batch_size, device)
+    swap_probs = predict_proba_texts(model, swapped_texts, vocab, config.max_length, config.batch_size, device)
     orig_preds = np.argmax(orig_probs, axis=1)
     swap_preds = np.argmax(swap_probs, axis=1)
     prob_shift = np.abs(orig_probs - swap_probs).max(axis=1)
@@ -659,125 +632,97 @@ def main() -> None:
     counterfactual_df = pd.DataFrame(counterfactual_records)
 
     explanation_cases_df = counterfactual_df.sort_values(
-        ["changed_prediction", "max_probability_shift"], ascending=[False, False]
+        ["changed_prediction", "max_probability_shift"],
+        ascending=[False, False],
     ).head(config.max_explanations)
 
     class_names = [f"profession_{i}" for i in range(num_labels)]
     lime_explainer = LimeTextExplainer(class_names=class_names)
 
     def wrapped_predict(texts: List[str]) -> np.ndarray:
-        return predict_proba_texts(
-            model=model,
-            tokenizer=tokenizer,
-            texts=texts,
-            max_length=config.max_length,
-            batch_size=config.per_device_eval_batch_size,
-            device=device,
-        )
+        return predict_proba_texts(model, texts, vocab, config.max_length, config.batch_size, device)
 
-    print("Preparing SHAP explainer...")
-    shap_explainer = shap.Explainer(wrapped_predict, tokenizer)
-
-    print("Computing explanation alignment metrics...")
+    print("Computing explanation metrics...")
     explanation_rows = []
     for _, row in tqdm(explanation_cases_df.iterrows(), total=len(explanation_cases_df)):
         text = row["text"]
         pred_label = int(row["orig_pred"])
 
-        att_imp = attention_word_importance(
-            model=model,
-            tokenizer=tokenizer,
-            text=text,
-            max_length=config.max_length,
-            device=device,
-        )
-        att_metrics = attribution_alignment_metrics(att_imp, gender_terms, config.top_k_alignment)
+        att = attention_word_importance(model, text, vocab, config.max_length, device)
+        att_metrics = attribution_alignment_metrics(att, gender_terms, config.top_k_alignment)
         explanation_rows.append(
             {
                 "method": "Attention",
                 "text": text,
-                **att_metrics,
                 "changed_prediction": row["changed_prediction"],
-                "swap_direction": row["swap_direction"],
+                **att_metrics,
             }
         )
 
-        lime_imp = lime_word_importance(
-            explainer=lime_explainer,
-            predict_fn=wrapped_predict,
-            text=text,
-            pred_label=pred_label,
-            num_features=config.lime_num_features,
-            num_samples=config.lime_num_samples,
-        )
-        lime_metrics = attribution_alignment_metrics(lime_imp, gender_terms, config.top_k_alignment)
+        try:
+            lime_imp = lime_word_importance(
+                lime_explainer,
+                wrapped_predict,
+                text,
+                pred_label,
+                config.lime_num_features,
+                config.lime_num_samples,
+            )
+            lime_metrics = attribution_alignment_metrics(lime_imp, gender_terms, config.top_k_alignment)
+        except Exception:
+            lime_metrics = {"gender_mass": 0.0, "topk_hit": 0.0, "first_gender_rank": float("inf"), "mrr": 0.0}
         explanation_rows.append(
             {
                 "method": "LIME",
                 "text": text,
-                **lime_metrics,
                 "changed_prediction": row["changed_prediction"],
-                "swap_direction": row["swap_direction"],
+                **lime_metrics,
             }
         )
 
-        shap_imp = shap_word_importance(
-            shap_explainer=shap_explainer,
-            text=text,
-            pred_label=pred_label,
-            max_evals=config.shap_max_evals,
-        )
-        shap_metrics = attribution_alignment_metrics(shap_imp, gender_terms, config.top_k_alignment)
+        try:
+            shap_imp = shap_word_importance(
+                text=text,
+                pred_label=pred_label,
+                predict_fn=wrapped_predict,
+                token_limit=config.shap_token_limit,
+                nsamples=config.shap_nsamples,
+            )
+            shap_metrics = attribution_alignment_metrics(shap_imp, gender_terms, config.top_k_alignment)
+        except Exception:
+            shap_metrics = {"gender_mass": 0.0, "topk_hit": 0.0, "first_gender_rank": float("inf"), "mrr": 0.0}
         explanation_rows.append(
             {
                 "method": "SHAP",
                 "text": text,
-                **shap_metrics,
                 "changed_prediction": row["changed_prediction"],
-                "swap_direction": row["swap_direction"],
+                **shap_metrics,
             }
         )
 
-    explanation_records_df = pd.DataFrame(explanation_rows)
-    method_summary_df = (
-        explanation_records_df.groupby("method")
-        .agg(
-            mean_gender_mass=("gender_mass", "mean"),
-            topk_hit_rate=("topk_hit", "mean"),
-            mean_mrr=("mrr", "mean"),
-            n=("method", "count"),
-        )
-        .reset_index()
-        .sort_values("topk_hit_rate", ascending=False)
-    )
-
-    save_tables_and_plots(
+    explanation_df = pd.DataFrame(explanation_rows)
+    method_summary_df = save_tables_and_plots(
         model_metrics_df=model_metrics_df,
         profession_gap_df=profession_gap_df,
         counterfactual_df=counterfactual_df,
-        explanation_records_df=explanation_records_df,
-        output_dir=out_dir,
+        explanation_df=explanation_df,
+        output_dir=output_dir,
     )
-    write_report_markdown(
-        output_dir=out_dir,
-        model_metrics_df=model_metrics_df,
-        method_summary_df=method_summary_df,
-        counterfactual_df=counterfactual_df,
-    )
+    write_report_markdown(output_dir, model_metrics_df, method_summary_df, counterfactual_df)
 
-    with (out_dir / "raw_metrics.json").open("w", encoding="utf-8") as f:
+    with (output_dir / "raw_metrics.json").open("w", encoding="utf-8") as f:
         json.dump(
             {
                 "overall_accuracy": float(overall_acc),
-                "gender_0_accuracy": float(gender0_acc),
-                "gender_1_accuracy": float(gender1_acc),
+                "gender_0_accuracy": float(g0_acc),
+                "gender_1_accuracy": float(g1_acc),
                 "counterfactual_change_rate": float(counterfactual_df["changed_prediction"].mean()),
             },
             f,
             indent=2,
         )
 
-    print("Done. Artifacts saved to:", out_dir.resolve())
+    print("Done. Artifacts saved to:", output_dir.resolve())
 
 
 if __name__ == "__main__":

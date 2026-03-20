@@ -1,0 +1,6 @@
+{
+  "overall_accuracy": 0.6673333333333333,
+  "gender_0_accuracy": 0.6511919698870765,
+  "gender_1_accuracy": 0.6856330014224751,
+  "counterfactual_change_rate": 0.13714285714285715
+}
